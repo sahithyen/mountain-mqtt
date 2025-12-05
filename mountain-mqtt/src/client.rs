@@ -328,6 +328,14 @@ impl<'a> ConnectionSettings<'a> {
             client_id,
         }
     }
+    pub fn authenticated(client_id: &'a str, username: &'a str, password: &'a [u8]) -> ConnectionSettings<'a> {
+        Self {
+            keep_alive: KEEP_ALIVE_DEFAULT,
+            username: username.into(),
+            password: password.into(),
+            client_id,
+        }
+    }
     pub fn client_id(&self) -> &'a str {
         self.client_id
     }
