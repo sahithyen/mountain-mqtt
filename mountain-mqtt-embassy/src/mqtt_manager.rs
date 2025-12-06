@@ -544,7 +544,11 @@ where
                 continue;
             }
         };
-        let IpAddress::Ipv4(address) = address;
+        let IpAddress::Ipv4(address) = address else {
+            #[cfg(feature = "defmt")]
+            defmt::warn!("MQTT DNS response was not IPv4");
+            continue;
+        };
 
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
 
