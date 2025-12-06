@@ -1,18 +1,20 @@
 use core::cell::RefCell;
+use embassy_net::IpAddress;
 // use defmt::*;
-use embassy_net::{tcp::TcpSocket, Ipv4Address, Stack};
+use embassy_net::{tcp::TcpSocket, Stack};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::{Receiver, Sender};
 use embassy_time::{Delay, Duration, Instant, Timer};
+use embedded_tls::{Aes128GcmSha256, TlsConfig, TlsConnection, TlsContext, UnsecureProvider};
 use mountain_mqtt::client::{
     Client, ClientError, ClientNoQueue, ClientReceivedEvent, ConnectionSettings, EventHandler,
     EventHandlerError,
 };
 use mountain_mqtt::data::quality_of_service::QualityOfService;
 use mountain_mqtt::embedded_hal_async::DelayEmbedded;
-use mountain_mqtt::embedded_io_async::ConnectionEmbedded;
 use mountain_mqtt::mqtt_manager::{ConnectionId, MqttOperations};
 use mountain_mqtt::packets::publish::ApplicationMessage;
+use rand_core::{CryptoRng, RngCore};
 // use {defmt_rtt as _, panic_probe as _};
 
 /// Convert an [ApplicationMessage] to an application-specific event type
@@ -53,9 +55,9 @@ impl defmt::Format for Error {
 /// and the various timeouts and intervals used to manage sending pings,
 /// monitoring whether connections are responsive, and when to report that
 /// a connection is stabilised.
-pub struct Settings {
-    /// The address of the MQTT server
-    pub address: Ipv4Address,
+pub struct Settings<'a> {
+    // The server name of the MQTT server
+    pub server_name: &'a str,
 
     /// The port of the MQTT server
     pub port: u16,
@@ -97,11 +99,11 @@ pub struct Settings {
     pub stabilisation_interval: Duration,
 }
 
-impl Settings {
+impl<'a> Settings<'a> {
     /// Create a new [Settings] with default intervals and timeouts
-    pub fn new(address: Ipv4Address, port: u16) -> Self {
+    pub fn new(server_name: &'a str, port: u16) -> Self {
         Self {
-            address,
+            server_name,
             port,
             ping_interval: Duration::from_millis(2000),
             connection_event_max_interval: Duration::from_millis(10000),
@@ -339,7 +341,7 @@ async fn handle_messages<'a, A, C, E, const Q: usize>(
     connection_settings: &ConnectionSettings<'static>,
     event_sender: &Sender<'static, NoopRawMutex, MqttEvent<E>, Q>,
     action_receiver: &mut Receiver<'static, NoopRawMutex, A, Q>,
-    settings: &Settings,
+    settings: &Settings<'a>,
 ) -> Result<(), Error>
 where
     C: Client<'a>,
@@ -503,16 +505,18 @@ where
 ///     .await;
 /// }
 /// ```
-pub async fn run<A, E, const P: usize, const B: usize, const Q: usize>(
+pub async fn run<A, E, const P: usize, const B: usize, const Q: usize, RNG>(
     stack: Stack<'static>,
     connection_settings: ConnectionSettings<'static>,
-    settings: Settings,
+    settings: Settings<'static>,
     event_sender: Sender<'static, NoopRawMutex, MqttEvent<E>, Q>,
     mut action_receiver: Receiver<'static, NoopRawMutex, A, Q>,
+    rng: &mut RNG,
 ) -> !
 where
     E: FromApplicationMessage<P> + Clone,
     A: MqttOperations + Clone,
+    RNG: CryptoRng + RngCore,
 {
     let mut rx_buffer = [0; B];
     let mut tx_buffer = [0; B];
@@ -521,11 +525,32 @@ where
     let mut connection_index = 0u32;
 
     loop {
+        let dns_result = stack
+            .dns_query(settings.server_name, embassy_net::dns::DnsQueryType::A)
+            .await;
+
+        let address = match dns_result {
+            Ok(response) => match response.first() {
+                Some(addr) => addr.clone(),
+                None => {
+                    #[cfg(feature = "defmt")]
+                    defmt::warn!("MQTT DNS response was empty");
+                    continue;
+                }
+            },
+            Err(e) => {
+                #[cfg(feature = "defmt")]
+                defmt::warn!("MQTT DNS query failed: {:?}", e);
+                continue;
+            }
+        };
+        let IpAddress::Ipv4(address) = address;
+
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
 
         socket.set_timeout(None);
 
-        let remote_endpoint = (settings.address, settings.port);
+        let remote_endpoint = (address, settings.port);
         #[cfg(feature = "defmt")]
         defmt::info!("MQTT socket connecting to {:?}...", remote_endpoint);
         if let Err(e) = socket.connect(remote_endpoint).await {
@@ -538,7 +563,23 @@ where
         #[cfg(feature = "defmt")]
         defmt::info!("MQTT socket connected!");
 
-        let connection = ConnectionEmbedded::new(socket);
+        let mut read_record_buffer = [0; 16384];
+        let mut write_record_buffer = [0; 16384];
+        let config: TlsConfig = TlsConfig::new()
+            .with_server_name(settings.server_name)
+            .enable_rsa_signatures();
+        let mut tls_connection =
+            TlsConnection::new(socket, &mut read_record_buffer, &mut write_record_buffer);
+
+        tls_connection
+            .open(TlsContext::new(
+                &config,
+                UnsecureProvider::new::<Aes128GcmSha256>(&mut *rng),
+            ))
+            .await
+            .expect("error establishing TLS connection");
+
+        let connection = tls_connection;
         let delay = DelayEmbedded::new(Delay);
         let timeout_millis = settings.response_timeout.as_millis() as u32;
 
